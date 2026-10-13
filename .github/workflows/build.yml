@@ -1,0 +1,212 @@
+name: Build Kernel M12
+
+# ------------------------------------------------------------------
+# Build kernel Exynos 850 untuk Galaxy M12 (SM-M127F / m12nsxx)
+# Hasil: Image (kernel) + dtb â€” diunduh sebagai artifact
+#
+# Cara pakai:
+#   1. Taruh file ini di .github/workflows/build.yml pada fork Master
+#   2. GitHub otomatis build
+#   3. Buka tab "Actions" -> klik run yang selesai -> unduh artifact
+# ------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Nama defconfig (tanpa _defconfig)'
+        required: true
+        default: 'exynos850-m12nsxx'
+      use_clang:
+        description: 'Pakai clang (true) atau gcc (false)'
+        required: true
+        default: 'true'
+  push:
+    branches:
+      - lineage-24.0
+
+jobs:
+  build:
+    name: Build ${{ github.event.inputs.defconfig || 'exynos850-m12nsxx' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      # ---------- 1. ambil source ----------
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Info source
+        run: |
+          echo "Commit : $(git rev-parse --short HEAD)"
+          echo "Branch : $(git rev-parse --abbrev-ref HEAD)"
+          echo "--- defconfig yang tersedia ---"
+          ls -la arch/arm64/configs/ | head -40
+
+      # ---------- 2. perkakas dasar ----------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 python3-pip zip unzip curl wget git \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            device-tree-compiler cpio kmod
+          echo "=== versi gcc ==="
+          aarch64-linux-gnu-gcc --version | head -1
+
+      # ---------- 3. clang AOSP (opsional) ----------
+      - name: Download AOSP clang
+        if: ${{ github.event.inputs.use_clang != 'false' }}
+        run: |
+          mkdir -p $HOME/clang
+          cd $HOME/clang
+          # clang-r450784d -> cocok untuk kernel 4.19 / Android 12-13
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r450784d.tar.gz \
+            -O clang.tar.gz || \
+          wget -q https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r450784d/archive/refs/heads/lineage-20.0.tar.gz \
+            -O clang.tar.gz
+          tar -xzf clang.tar.gz
+          ls -d $HOME/clang/*/ 2>/dev/null || ls -la $HOME/clang
+          echo "$HOME/clang/bin" >> $GITHUB_PATH
+
+      # ---------- 4. build dengan CLANG ----------
+      - name: Build kernel (clang)
+        if: ${{ github.event.inputs.use_clang != 'false' }}
+        env:
+          DEFCONFIG: ${{ github.event.inputs.defconfig || 'exynos850-m12nsxx' }}
+        run: |
+          set -e
+          CLANG_DIR=$(dirname $(find $HOME/clang -maxdepth 3 -name clang -type f | head -1))
+          echo "clang dir = $CLANG_DIR"
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$CLANG_DIR:$PATH"
+
+          MAKE_ARGS="ARCH=arm64 O=out CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LLVM=1 LLVM_IAS=1"
+
+          echo "=== langkah 1: defconfig ==="
+          make $MAKE_ARGS ${DEFCONFIG}_defconfig
+
+          echo "=== langkah 2: siapkan build ==="
+          make $MAKE_ARGS -j$(nproc) prepare || true
+          make $MAKE_ARGS -j$(nproc) scripts || true
+
+          echo "=== langkah 3: build Image ==="
+          make $MAKE_ARGS -j$(nproc) Image -k 2>&1 | tail -60
+
+          echo "=== langkah 4: build dtb ==="
+          make $MAKE_ARGS -j$(nproc) dtbs -k 2>&1 | tail -30 || true
+
+      # ---------- 5. build dengan GCC (cadangan) ----------
+      - name: Build kernel (gcc)
+        if: ${{ github.event.inputs.use_clang == 'false' }}
+        env:
+          DEFCONFIG: ${{ github.event.inputs.defconfig || 'exynos850-m12nsxx' }}
+        run: |
+          set -e
+          export ARCH=arm64
+          export SUBARCH=arm64
+          MAKE_ARGS="ARCH=arm64 O=out \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+
+          echo "=== defconfig ==="
+          make $MAKE_ARGS ${DEFCONFIG}_defconfig
+
+          echo "=== build Image ==="
+          make $MAKE_ARGS -j$(nproc) Image -k 2>&1 | tail -60
+
+          echo "=== build dtb ==="
+          make $MAKE_ARGS -j$(nproc) dtbs -k 2>&1 | tail -30 || true
+
+      # ---------- 6. periksa hasil ----------
+      - name: Cek hasil build
+        run: |
+          echo "=== CARI Image ==="
+          find . -name "Image" -o -name "Image.gz" -o -name "zImage" 2>/dev/null | while read f; do
+            echo "  $f  -> $(stat -c%s "$f") B  ($(du -h "$f" | cut -f1))"
+          done
+
+          echo ""
+          echo "=== CARI dtb ==="
+          find . -name "*.dtb" 2>/dev/null | head -20 | while read f; do
+            echo "  $f  -> $(stat -c%s "$f") B"
+          done
+
+          echo ""
+          echo "=== ISI out/arch/arm64/boot/ ==="
+          ls -la out/arch/arm64/boot/ 2>/dev/null || echo "  (kosong)"
+
+          echo ""
+          echo "=== ISI out/arch/arm64/boot/dts/exynos/ ==="
+          ls -la out/arch/arm64/boot/dts/exynos/ 2>/dev/null | head -30 || echo "  (kosong)"
+
+      # ---------- 7. siapkan artifact ----------
+      - name: Susun berkas hasil
+        run: |
+          mkdir -p HASIL
+
+          # kernel
+          for f in out/arch/arm64/boot/Image out/arch/arm64/boot/Image.gz \
+                   arch/arm64/boot/Image arch/arm64/boot/Image.gz; do
+            if [ -f "$f" ]; then
+              cp "$f" HASIL/
+              echo "kernel <- $f"
+            fi
+          done
+
+          # dtb
+          if [ -d out/arch/arm64/boot/dts/exynos ]; then
+            mkdir -p HASIL/dtb
+            find out/arch/arm64/boot/dts/exynos -name "*.dtb" -exec cp {} HASIL/dtb/ \; 2>/dev/null
+            echo "dtb <- out/arch/arm64/boot/dts/exynos"
+          fi
+
+          # info build
+          echo "Commit : $(git rev-parse HEAD)"          >  HASIL/INFO.txt
+          echo "Branch : $(git rev-parse --abbrev-ref HEAD)" >> HASIL/INFO.txt
+          echo "Tanggal: $(date -u)"                     >> HASIL/INFO.txt
+          echo "Clang  : ${{ github.event.inputs.use_clang }}" >> HASIL/INFO.txt
+          echo "Defcfg : ${{ github.event.inputs.defconfig || 'exynos850-m12nsxx' }}" >> HASIL/INFO.txt
+          echo ""                                        >> HASIL/INFO.txt
+
+          # kernel config hasil akhir (untuk diaudit)
+          if [ -f out/.config ]; then
+            cp out/.config HASIL/config-final.txt
+            echo "--- cek config penting ---" >> HASIL/INFO.txt
+            grep -E "CONFIG_MACH_SAMSUNG_M12|CONFIG_DM_VERITY|CONFIG_OVERLAY_FS|CONFIG_KSU|CONFIG_EXYNOS_KERNEL_PROTECTION|CONFIG_LOCALVERSION" out/.config >> HASIL/INFO.txt || true
+          fi
+
+          echo ""
+          echo "=== ISI HASIL/ ==="
+          ls -laR HASIL/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-m12-${{ github.run_number }}
+          path: HASIL/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Ringkasan
+        if: always()
+        run: |
+          echo "## Hasil Build Kernel M12" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Berkas | Ukuran |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          if [ -d HASIL ]; then
+            find HASIL -type f -exec sh -c 'echo "| $(basename {}) | $(stat -c%s {}) B |"' \; >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Unduh di tab **Actions** -> run terakhir -> **Artifacts**." >> $GITHUB_STEP_SUMMARY
+
